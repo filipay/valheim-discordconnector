@@ -116,6 +116,24 @@ internal class DiscordApi
         }
     }
 
+    // Caller has already escaped and bounded the report; do not expand templates or add configured embed text.
+    internal static void SendRenderedMessage(Webhook.Event ev, string message)
+    {
+        DiscordExecuteWebhook payload = new()
+        {
+            allowed_mentions = new AllowedMentions { parse = [], roles = [], users = [], replied_user = false }
+        };
+        if (DiscordConnectorPlugin.StaticConfig.DiscordEmbedsEnabled)
+        {
+            payload.embeds = [new DiscordEmbed { description = message }];
+        }
+        else
+        {
+            payload.content = message;
+        }
+        payload.SendFor(ev);
+    }
+
     /// <summary>
     ///     Send a message with fields to Discord.
     ///     Uses enhanced embed formatting if embeds are enabled in configuration.

@@ -15,6 +15,8 @@ Connect your Valheim server to Discord. ([See website for installation or config
 
 See [the README](Metadata/README.md) for the plugin.
 
+See [server statistics: as-built behavior, limits and manual rollout](docs/server-statistics-audit.md).
+
 ## Changelog
 
 See [the changelog](docs/changelog.md).

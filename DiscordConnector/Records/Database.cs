@@ -22,7 +22,11 @@ namespace DiscordConnector.Records;
 internal class Database
 {
     private const string DB_NAME = "records.db";
-    private static string DbPath = "";
+    private readonly string DbPath;
+    private readonly object lifecycle = new();
+    private Task? initialization;
+    private CombatStore? combat;
+    private bool disposed;
     private LiteDatabase db;
     private ILiteCollection<SimpleStat> DeathCollection;
     private ILiteCollection<SimpleStat> JoinCollection;
@@ -30,6 +34,27 @@ internal class Database
     private ILiteCollection<SimpleStat> PingCollection;
     private ILiteCollection<PlayerToName> PlayerToNameCollection;
     private ILiteCollection<SimpleStat> ShoutCollection;
+
+    internal CombatStore Combat
+    {
+        get
+        {
+            lock (lifecycle)
+            {
+                if (disposed) throw new ObjectDisposedException(nameof(Database));
+                try
+                {
+                    initialization!.GetAwaiter().GetResult();
+                }
+                catch (Exception exception)
+                {
+                    throw new InvalidOperationException("Combat database initialization failed.", exception);
+                }
+
+                return combat!;
+            }
+        }
+    }
 
     /// <summary>
     ///     Sets up the database path and initializes the database connection.
@@ -64,34 +89,38 @@ internal class Database
     /// </summary>
     public void Initialize()
     {
-        Task.Run(() =>
+        lock (lifecycle)
         {
-            try
+            if (disposed) throw new ObjectDisposedException(nameof(Database));
+            if (initialization != null) return;
+            initialization = Task.Run(() =>
             {
-                db = new LiteDatabase(DbPath);
-                DiscordConnectorPlugin.StaticLogger.LogDebug($"LiteDB Connection Established to {DbPath}");
-
-                // Grab references to the collections
-                DeathCollection = db.GetCollection<SimpleStat>("deaths");
-                JoinCollection = db.GetCollection<SimpleStat>("joins");
-                LeaveCollection = db.GetCollection<SimpleStat>("leaves");
-                ShoutCollection = db.GetCollection<SimpleStat>("shouts");
-                PingCollection = db.GetCollection<SimpleStat>("pings");
-                PlayerToNameCollection = db.GetCollection<PlayerToName>("player_name");
-
-                // Ensure indices on the collections
-                Task.Run(() =>
+                try
                 {
+                    db = new LiteDatabase(DbPath);
+                    DiscordConnectorPlugin.StaticLogger.LogDebug($"LiteDB Connection Established to {DbPath}");
+
+                    // Grab references to the collections
+                    DeathCollection = db.GetCollection<SimpleStat>("deaths");
+                    JoinCollection = db.GetCollection<SimpleStat>("joins");
+                    LeaveCollection = db.GetCollection<SimpleStat>("leaves");
+                    ShoutCollection = db.GetCollection<SimpleStat>("shouts");
+                    PingCollection = db.GetCollection<SimpleStat>("pings");
+                    PlayerToNameCollection = db.GetCollection<PlayerToName>("player_name");
+
                     EnsureIndicesOnCollections();
                     DiscordConnectorPlugin.StaticLogger.LogDebug("Created indices on database collections");
-                }).ConfigureAwait(false);
-            }
-            catch (IOException e)
-            {
-                DiscordConnectorPlugin.StaticLogger.LogError($"Unable to acquire un-shared access to {DbPath}");
-                DiscordConnectorPlugin.StaticLogger.LogDebug(e.ToString());
-            }
-        }).ConfigureAwait(false);
+                    combat = new CombatStore(db);
+                }
+                catch (Exception exception)
+                {
+                    db?.Dispose();
+                    DiscordConnectorPlugin.StaticLogger.LogError($"Unable to initialize database at {DbPath}");
+                    DiscordConnectorPlugin.StaticLogger.LogDebug(exception.ToString());
+                    throw;
+                }
+            });
+        }
     }
 
     /// <summary>
@@ -118,9 +147,24 @@ internal class Database
     /// </summary>
     public void Dispose()
     {
-        if (db == null) return;
-        DiscordConnectorPlugin.StaticLogger.LogDebug("Closing LiteDB connection");
-        db.Dispose();
+        lock (lifecycle)
+        {
+            if (disposed) return;
+            try
+            {
+                initialization?.GetAwaiter().GetResult();
+            }
+            catch (Exception) when (initialization?.IsFaulted == true)
+            {
+                // Initialization already logged the failure; it must not prevent the remaining plugin cleanup.
+            }
+            finally
+            {
+                disposed = true;
+                DiscordConnectorPlugin.StaticLogger.LogDebug("Closing LiteDB connection");
+                db?.Dispose();
+            }
+        }
     }
 
     /// <summary>

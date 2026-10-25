@@ -1,0 +1,33 @@
+name: Combat regressions
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.x'
+
+      - name: Run combat statistics regression harness
+        run: dotnet run --project tests/CombatStatistics/CombatStatistics.csproj --configuration Release
+
+      - name: Run combat tracking regression harness
+        run: dotnet run --project tests/CombatTracking/CombatTracking.csproj --configuration Release
+
+      - name: Run combat reporting regression harness
+        run: dotnet run --project tests/CombatReporting/CombatReporting.csproj --configuration Release
+
+      - name: Run ServerStart regression harness
+        run: dotnet run --project tests/ServerStartRegression/ServerStartRegression.csproj --configuration Release

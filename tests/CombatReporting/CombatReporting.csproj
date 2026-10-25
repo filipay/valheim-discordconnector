@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="LiteDB" Version="5.0.21" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <Compile Include="../../DiscordConnector/Config/CombatConfig.cs" Link="CombatConfig.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/CombatReports.cs" Link="CombatReports.cs" />
+    <Compile Include="../../DiscordConnector/Records/CombatRecord.cs" Link="CombatRecord.cs" />
+    <Compile Include="../../DiscordConnector/Records/CombatStore.cs" Link="CombatStore.cs" />
+    <Compile Include="../../DiscordConnector/DiscordApi.cs" Link="DiscordApi.cs" />
+    <Compile Include="../../DiscordConnector/MessageTransformer.cs" Link="MessageTransformer.cs" />
+    <Compile Include="../../DiscordConnector/EmbedBuilder.cs" Link="EmbedBuilder.cs" />
+    <Compile Include="../../DiscordConnector/EmbedTemplates.cs" Link="EmbedTemplates.cs" />
+    <Compile Include="../../DiscordConnector/Webhook.cs" Link="Webhook.cs" />
+  </ItemGroup>
+</Project>

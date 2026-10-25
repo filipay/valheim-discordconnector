@@ -1,8 +1,11 @@
+using System;
+using System.Globalization;
 using System.IO;
 
 using BepInEx;
 
 using DiscordConnector.Common;
+using DiscordConnector.Config;
 using DiscordConnector.Leaderboards;
 using DiscordConnector.Records;
 
@@ -25,16 +28,20 @@ public class DiscordConnectorPlugin : BaseUnityPlugin
 
     internal static VdcLogger StaticLogger = null!; // initialized in constructor
     internal static PluginConfig StaticConfig = null!; // initialized in constructor
+    internal static CombatConfig StaticCombatConfig = null!; // initialized in constructor
     internal static Database StaticDatabase = null!; // initialized in constructor
     private static readonly LeaderbBoard StaticLeaderBoards = new();
     internal static readonly EventWatcher StaticEventWatcher = new();
     private static string s_publicIpAddress = "";
     private Harmony? _harmony;
+    private CombatReports? _combatReports;
+    private DateTime _nextCombatReportCheckUtc;
 
     public DiscordConnectorPlugin()
     {
         StaticLogger = new VdcLogger(Logger, Path.Combine(Paths.ConfigPath, LegacyConfigPath));
         StaticConfig = new PluginConfig(Config);
+        StaticCombatConfig = new CombatConfig(Config);
         StaticDatabase = new Database(Paths.GameRootPath);
     }
 
@@ -131,11 +138,45 @@ public class DiscordConnectorPlugin : BaseUnityPlugin
             playerActivityTimer.Start();
         }
 
+        if (StaticCombatConfig.DailyEnabled || StaticCombatConfig.WeeklyEnabled)
+        {
+            _combatReports = new CombatReports(StaticCombatConfig.DailyEnabled, StaticCombatConfig.WeeklyEnabled,
+                StaticCombatConfig.TimeZoneId, StaticCombatConfig.TopCount,
+                (world, start, end) => StaticDatabase.Combat.Query(world, start, end),
+                (id, now) => StaticDatabase.Combat.TryClaimReport(id, now),
+                message => DiscordApi.SendRenderedMessage(Webhook.Event.LeaderboardsAll, message),
+                message => StaticLogger.LogWarning(message));
+        }
+
         _harmony = Harmony.CreateAndPatchAll(typeof(DiscordConnectorPlugin).Assembly, ModGuid);
+    }
+
+    private void Update()
+    {
+        if (_combatReports == null) return;
+        DateTime nowUtc = DateTime.UtcNow;
+        if (nowUtc < _nextCombatReportCheckUtc) return;
+        _nextCombatReportCheckUtc = nowUtc.AddMinutes(1);
+        try
+        {
+            // Snapshot Unity state on the main thread; no pool timer may query world identity.
+            if (ZNet.instance == null || !ZNet.instance.IsServer() || !ZNet.instance.IsDedicated()) return;
+            if (ZNet.GetWorldIfIsHost() == null) return;
+            long worldUid = ZNet.instance.GetWorldUID();
+            if (worldUid != 0) _combatReports.Tick(nowUtc, worldUid.ToString(CultureInfo.InvariantCulture));
+        }
+        catch (Exception ex)
+        {
+            _combatReports.Dispose();
+            _combatReports = null;
+            StaticLogger.LogWarning($"Combat reports disabled after world snapshot failure ({ex.GetType().Name}); tracking is unchanged.");
+        }
     }
 
     private void OnDestroy()
     {
+        _combatReports?.Dispose();
+        _combatReports = null;
         StaticDatabase.Dispose();
         _harmony?.UnpatchSelf();
     }
