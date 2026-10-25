@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/VHINSTALL
-          key: ${{ steps.valheimversion.outputs.valheimversion }}-BepInExPack-5.4.2333
+          key: ${{ steps.valheimversion.outputs.valheimversion }}-BepInExPack-5.4.2333-linux-v2
 
       - name: Install SteamCMD
         if: steps.cachevalheim.outputs.cache-hit != 'true'
@@ -78,8 +78,20 @@ jobs:
         run: |
           wget -O bepinex.zip "https://thunderstore.io/package/download/denikson/BepInExPack_Valheim/5.4.2333/"
           unzip bepinex.zip -d ~/BepInExRaw
-          steamcmd +force_install_dir ~/VHINSTALL +login anonymous +app_update 896660 validate +exit
-          mv ~/VHINSTALL/valheim_server_Data/ ~/VHINSTALL/valheim_Data/
+          for attempt in 1 2 3; do
+            steamcmd +force_install_dir "$HOME/VHINSTALL" +login anonymous +app_update 896660 validate +exit || true
+            # SteamCMD can report an install failure with exit code zero.
+            if [ -s "$HOME/VHINSTALL/valheim_server_Data/Managed/assembly_valheim.dll" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Valheim managed assembly missing after 3 SteamCMD attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          # Keep Jotunn's server directory; project HintPaths use lowercase valheim_Data.
+          ln -s valheim_server_Data "$HOME/VHINSTALL/valheim_Data"
           mv ~/BepInExRaw/BepInExPack_Valheim/* ~/VHINSTALL/
 
       - name: Remove old publicized dlls from cache
@@ -93,7 +105,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ~/VHINSTALL
-          key: ${{ steps.valheimversion.outputs.valheimversion }}-BepInExPack-5.4.2333
+          key: ${{ steps.valheimversion.outputs.valheimversion }}-BepInExPack-5.4.2333-linux-v2
 
       - name: Set references to DLLs
         run: |
@@ -106,7 +118,8 @@ jobs:
       # Build DLLs
       - name: Build solution
         run: |
-          dotnet build DiscordConnector.sln
+          # Each project's Jotunn task reads/writes the same publicized assemblies.
+          dotnet build DiscordConnector.sln -m:1
 
       # ℹ️ Command-line programs to run using the OS shell.
       # 📚 https://git.io/JvXDl
