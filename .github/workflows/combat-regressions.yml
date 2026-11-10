@@ -31,3 +31,6 @@ jobs:
 
       - name: Run ServerStart regression harness
         run: dotnet run --project tests/ServerStartRegression/ServerStartRegression.csproj --configuration Release
+
+      - name: Run native adapter regression harness
+        run: dotnet run --project tests/NativeAdapters/NativeAdapters.csproj --configuration Release

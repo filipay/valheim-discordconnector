@@ -6,5 +6,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../DiscordConnector/Patches/ZNetPatches.cs" Link="ZNetPatches.cs" />
+    <Compile Include="../../DiscordConnector.Common/Common/Logger.cs" Link="Logger.cs" />
   </ItemGroup>
 </Project>

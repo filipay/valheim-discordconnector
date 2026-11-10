@@ -75,6 +75,71 @@ static void SentFinal()
 
 var tests = new (string Name, Action Run)[]
 {
+    ("logger delegates synchronously without context posts or custom log files", () =>
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "vdc-logger-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        var context = new CapturingSynchronizationContext();
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            var native = new BepInEx.Logging.ManualLogSource();
+            var logger = new DiscordConnector.Common.VdcLogger(native, directory);
+            native.Entries.Clear();
+            logger.LogDebug("disabled");
+            Assert(logger.LogDebugAsync("disabled async").IsCompletedSuccessfully, "Disabled debug task did not complete inline");
+            Assert(native.Entries.Count == 0, "Default-disabled debug reached native logging");
+            Assert(!Directory.EnumerateFileSystemEntries(directory).Any(), "Disabled debug created a custom log file");
+
+            logger.SetLogLevel(true);
+            var methods = new (string Level, Action<string> Sync, Func<string, Task> Async)[]
+            {
+                ("Info", logger.LogDebug, logger.LogDebugAsync),
+                ("Info", logger.LogInfo, logger.LogInfoAsync),
+                ("Warning", logger.LogWarning, logger.LogWarningAsync),
+                ("Error", logger.LogError, logger.LogErrorAsync),
+                ("Fatal", logger.LogFatal, logger.LogFatalAsync)
+            };
+            foreach (var method in methods)
+            {
+                method.Sync("sync " + method.Level);
+                Assert(method.Async("async " + method.Level).IsCompletedSuccessfully, "Async compatibility wrapper did not complete inline");
+            }
+            Assert(native.Entries.SequenceEqual(methods.SelectMany(m => new[]
+            {
+                (m.Level, (object)("sync " + m.Level)), (m.Level, (object)("async " + m.Level))
+            })), "Native logging levels, messages or call counts changed");
+            logger.SetLogLevel(false);
+            logger.LogDebug("disabled again");
+            Assert(logger.LogDebugAsync("disabled again async").IsCompletedSuccessfully && native.Entries.Count == 10,
+                "Disabling debug did not suppress both wrappers");
+            Assert(context.Posts == 0, "Logging posted a captured-context continuation");
+            Assert(!Directory.EnumerateFileSystemEntries(directory).Any(), "Logging created a custom log file");
+
+            string[] legacyFiles = Enumerable.Range(0, 6).Select(i => Path.Combine(directory, i == 0 ? "vdc.log" : $"vdc.log.{i}")).ToArray();
+            foreach (string file in legacyFiles) File.WriteAllText(file, Path.GetFileName(file));
+            _ = new DiscordConnector.Common.VdcLogger(native, directory);
+            Assert(Directory.GetFiles(directory).Length == legacyFiles.Length && legacyFiles.All(file =>
+                File.Exists(file) && File.ReadAllText(file) == Path.GetFileName(file)), "Existing custom logs were rotated, deleted or changed");
+
+            var failure = new InvalidOperationException("native listener failure");
+            native.InfoFailure = failure;
+            Task failedLog = logger.LogInfoAsync("listener throws");
+            Assert(failedLog.IsFaulted && ReferenceEquals(failedLog.Exception?.InnerException, failure),
+                "Async logging did not return a faulted Task containing the original exception");
+            Exception? syncFailure = null;
+            try { logger.LogInfo("listener throws synchronously"); }
+            catch (Exception error) { syncFailure = error; }
+            Assert(ReferenceEquals(syncFailure, failure), "Synchronous logging did not throw the original exception");
+            Assert(context.Posts == 0, "Logging failure posted a captured-context continuation");
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+            Directory.Delete(directory, true);
+        }
+    }),
     ("crossplay LoadWorld does not send an empty join code", () =>
     {
         Reset(); Load();

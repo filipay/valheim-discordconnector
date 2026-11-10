@@ -61,10 +61,7 @@ internal sealed class CombatStore
         RequireUtc(endUtc, nameof(endUtc));
         if (endUtc < startUtc) throw new ArgumentException("The end must not precede the start.", nameof(endUtc));
 
-        return kills.Find(LiteDB.Query.And(
-                LiteDB.Query.EQ(nameof(CombatRecord.WorldId), worldId),
-                LiteDB.Query.GTE(nameof(CombatRecord.TimestampUtc), startUtc.Ticks),
-                LiteDB.Query.LT(nameof(CombatRecord.TimestampUtc), endUtc.Ticks)))
+        return kills.Find(BsonExpression.Create("WorldId = @0 AND TimestampUtc >= @1 AND TimestampUtc < @2", worldId, startUtc.Ticks, endUtc.Ticks))
             .Select(document => mapper.ToObject<CombatRecord>(document))
             // Legacy databases can have a case-insensitive collation; world identity is still exact.
             .Where(record => string.Equals(record.WorldId, worldId, StringComparison.Ordinal))

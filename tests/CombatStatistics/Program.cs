@@ -4,12 +4,23 @@ using DiscordConnector.Records;
 
 using LiteDB;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly DateTime Start = new(2026, 12, 31, 23, 59, 59, DateTimeKind.Utc);
     private static readonly DateTime End = Start.AddSeconds(2);
     private static readonly (string Name, Action<string> Run)[] Tests =
     [
+        ("observation ids, worlds, cooking sessions and retention cutoffs do not grow LiteDB expression caches", ExpressionCacheBounded),
+        ("coalesced coverage preserves three numerical drops", CoalescedLossCoverage),
+        ("full replay cache counts new refusals, not duplicate witnesses", LossReplayRejections),
+        ("ambiguous diagnostic acknowledgment reconciles without gameplay replay", LossAmbiguousAcknowledgment),
+        ("absolute loss snapshots merge by field and epoch across reopen", LossEpochsAndReopen),
+        ("loss state saturates and refuses a 65th key without eviction", LossBounds),
+        ("diagnostics reserve one existing slot and serialize with gameplay", LossQueueReservation),
+        ("diagnostic failures retain totals and retry only on maintenance", LossWriteFailure),
+        ("an in-flight acknowledgment cannot erase a newer cumulative value", LossInFlightUpdate),
+        ("collector refusal, flush, reset and world change retain loss ownership", LossCollectorBoundaries),
+        ("failed gameplay batch is uncertain, never replayed or declared absent", LossGameplayUncertainty),
         ("legacy collections survive initialization, insert and restart", LegacySurvives),
         ("duplicate inserts are atomic across stores and restart", ConcurrentDuplicates),
         ("world and victim form an unambiguous durable identity", WorldSeparation),
@@ -23,11 +34,58 @@ internal static class Program
         ("report claims are atomic and survive restart", ReportClaims),
         ("invalid report claims fail without claiming", InvalidClaims),
         ("early Combat access waits and shutdown closes its database", EarlyAccessAndShutdown),
-        ("initialization failure is explicit and does not create another database", InitializationFailure)
+        ("initialization failure is explicit and does not create another database", InitializationFailure),
+        ("activity replay, boundaries and exploration grid fencing survive restart", ActivityRestart),
+        ("sampled biomes deduplicate per player/day and distinct report period across restart", BiomeVisitStorage),
+        ("boss cohorts deduplicate per key/window and survive restart", BossCreditStorage),
+        ("player travel intervals clip and dedup across restart with independent biome totals", PlayerTravelStorage),
+        ("simulation damage and per-participant kills preserve dedup flags worlds and restart", SimulationCombatStorage),
+        ("reported and confirmed kills merge before bounded ranking", SimulationCombinedRanking),
+        ("longest bow hit keeps per-player daily weekly maxima with dedup and range fences", LongestBowHitStorage),
+        ("sailing distance is additive, clipped, ranked and survives reopen", SailingDistanceStorage),
+        ("health loss persists exact HP with own flag, boundaries, dedup and restart", HealthLostStorage),
+        ("retired metric histories remain untouched and new writes contain only kept data", RetiredMetricHistory),
+        ("planted crops deduplicate world/ZDOID across accounts, tokens and restart", CropStorage),
+        ("ReportedSignalsRestartAndIsolation", ReportedSignalsRestartAndIsolation),
+        ("signal retention keeps cutoff equality and unrelated history", SignalRetentionBoundaries),
+        ("signal retention uses indexed bounded batches across all kinds", SignalRetentionBounds),
+        ("signal retention deletion survives restart", SignalRetentionRestart),
+        ("backdated duplicate cannot replace live signal detail", SignalRetentionLiveDuplicate),
+        ("signal retention uses the current clock after corrections", SignalRetentionClocks),
+        ("signal retention validates UTC and bounded limits before writing", SignalRetentionValidation),
+        ("retention skips full queues and preserves diagnostic capacity", RetentionQueueBounds),
+        ("retention cadence, quota reservations and clean drain share the existing tail", RetentionCadenceAndDrain),
+        ("retention rejects invalid clocks without resetting admission cadence", RetentionWorkerClocks),
+        ("queued inserts and pruning respect maintenance ordering", RetentionWorkerOrdering),
+        ("retention failure releases admission without classifying gameplay loss", RetentionWorkerFailure),
+        ("retention continuation attachment failure releases its slot and marker", RetentionAttachmentFailure),
+        ("SignalBatchAccounting", SignalBatchAccounting),
+        ("SignalRecordValidation", SignalRecordValidation),
+        ("SignalOutstandingAccounting", SignalOutstandingAccounting),
+        ("one signal origin cannot monopolize outstanding work", SignalPrincipalFairness),
+        ("SignalFailureAndDrain", SignalFailureAndDrain),
+        ("signal diagnostics expose only stage and count, not payloads", SignalDiagnostics),
+        ("CookingGenerationRestart", CookingGenerationRestart),
+        ("database diagnostics redact hostile exceptions and bound detail", DiagnosticRedaction),
+        ("database diagnostic budgets suppress and recover independently", DiagnosticBudgets),
+        ("rollback failure preserves the original exception and stack", RollbackPreservesOriginal),
+        ("worker diagnostics identify stages without exposing records", WorkerDiagnostics),
+        ("throwing diagnostic callback cannot poison the worker", DiagnosticCallbackFailure),
+        ("shutdown returns while accepted activity is blocked and drains before close", NonblockingShutdown),
+        ("shutdown drains accepted legacy writes even when a report fails", ShutdownLegacyWrites),
+        ("shutdown waits off-thread for synchronous legacy readers", ShutdownLegacyReader),
+        ("early legacy writes are owned through initialization and shutdown", EarlyLegacyShutdown),
+        ("activity BeginDrain seals admission without owning the borrowed database", BorrowedActivityDrain)
     ];
 
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Length != 0)
+        {
+            if (args.SequenceEqual(new[] { "--growth-check" })) return GrowthCheck();
+            Console.WriteLine("Usage: CombatStatistics [--growth-check]");
+            return 1;
+        }
         int failures = 0;
         foreach ((string name, Action<string> run) in Tests)
         {
@@ -107,7 +165,7 @@ internal static class Program
         CombatStore restored = new(reopened);
         Equal(1, restored.Query("world", Start, End).Count, "combat persisted in same database");
         Check(!restored.Insert(Record()), "restart duplicate rejected");
-        Check(!reopened.GetCollectionNames().Except(names.Concat(["combat_kills", "combat_reports"])).Any(), "no unrelated collections");
+        Check(!reopened.GetCollectionNames().Except(names.Concat(["combat_kills", "combat_reports"]).Concat(ActivityStore.CollectionNames)).Any(), "no unrelated collections");
         string[] indexes = reopened.Execute("SELECT name FROM $indexes WHERE collection = 'combat_kills'")
             .ToArray().Select(x => x["name"].AsString).ToArray();
         foreach (string field in new[] { "WorldId", "TimestampUtc", "PlayerId" })

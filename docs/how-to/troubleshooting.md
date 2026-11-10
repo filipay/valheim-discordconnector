@@ -2,6 +2,8 @@
 
 Discord Connector provides a few ways to troubleshoot.
 
+Logs are written through BepInEx to its console and `LogOutput.log`. Discord Connector no longer creates or rotates its own `vdc.log`; existing copies are left untouched. Redact webhook URLs, tokens and personal information before sharing logs.
+
 ## Enable Debug Logging
 
 It's possible to get debug messages from Discord Connector in 2 ways. You can enable the DEBUG log level in the BepInEx configuration. Or you can change the [Main Config - Log Debug Messages](/config/main#log-debug-messages) to true to have Discord Connector send its DEBUG level logs to the normal (INFO) channel. This setting will cause the extra logs from Discord Connector to show up in the console and in the `LogOutput.log` file.

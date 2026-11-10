@@ -6,8 +6,10 @@ From the repository root, with .NET SDK 8 or newer and the .NET 8 runtime instal
 dotnet run --project tests/ServerStartRegression/ServerStartRegression.csproj
 ```
 
-Links the actual production `ZNetPatches.cs`; no test packages or network calls.
-Game, Unity clock, Harmony attributes, formatter and Discord sender are stubbed.
+Links the actual production `ZNetPatches.cs` and common `Logger.cs`; no test packages or network calls.
+Game, Unity clock, Harmony attributes, formatter, Discord sender and native log source are stubbed.
+The logger check covers synchronous/Task API compatibility, debug gating, native levels,
+no synchronization-context posts, no custom file creation and preservation of legacy logs.
 The harness invokes the attributed prefixes/postfixes in lifecycle order; it does
 not validate runtime Harmony weaving, Unity object semantics or game callbacks.
 It rejects multiple target attributes on one class rather than incorrectly

@@ -6,8 +6,6 @@ namespace UnityEngine
         public bool Alive = true;
         public static implicit operator bool(Object? value) => value != null && value.Alive;
     }
-    public struct Vector3 { public float x; }
-    public class Transform { public Vector3 position; }
 }
 
 public struct ZDOID
@@ -15,6 +13,10 @@ public struct ZDOID
     public long UserID;
     public uint ID;
     public override string ToString() => UserID + ":" + ID;
+    public static bool operator ==(ZDOID a, ZDOID b) => a.UserID == b.UserID && a.ID == b.ID;
+    public static bool operator !=(ZDOID a, ZDOID b) => !(a == b);
+    public override bool Equals(object? other) => other is ZDOID id && this == id;
+    public override int GetHashCode() => HashCode.Combine(UserID, ID);
 }
 public class ZDO
 {
@@ -33,24 +35,34 @@ public class ZNetView : UnityEngine.Object
     public bool IsValid() => Zdo != null;
     public string GetPrefabName() => Prefab;
 }
-public class Character : UnityEngine.Object
+public class CookingStation : UnityEngine.Object
 {
+    public enum Status { NotDone, Done, Burnt }
+    public class Item : UnityEngine.Object
+    {
+        public string name = "";
+        public ItemData m_itemData = new();
+    }
+    public class ItemData { public int m_stack = 1; public Food m_shared = new(); }
+    public class Food { public float m_food = 1, m_foodStamina, m_foodEitr; }
+    public class ItemConversion { public Item m_from = new() { name = "raw" }, m_to = new() { name = "cooked" }; public float m_cookTime = 10; }
     public ZNetView m_nview = new();
-    public UnityEngine.Transform transform = new();
-    public float Health = 10;
-    public bool Player;
-    public bool Tamed;
-    public bool Boss;
-    public ZDOID GetZDOID() => m_nview.GetZDO()?.m_uid ?? default;
-    public float GetHealth() => Health;
-    public bool IsPlayer() => Player;
-    public bool IsTamed() => Tamed;
-    public bool IsBoss() => Boss;
-    public void ApplyDamage(HitData hit) { }
-    public void OnDeath() { }
-    public void SetHealth(float health) => Health = health;
+    public object[] m_slots = new object[1];
+    public List<ItemConversion> m_conversion = new() { new() };
+    public string ItemName = "";
+    public float Progress;
+    public Status SlotStatus;
+    public void GetSlot(int slot, out string name, out float progress, out Status status, out int unused)
+    { name = ItemName; progress = Progress; status = SlotStatus; unused = 0; }
+    public void RPC_AddItem(long sender, string item) { }
+    public void UpdateCooking() { }
+    public void RPC_RemoveDoneItem() { }
+    public void DropAllItems() { }
 }
-public class HitData { public ZDOID m_attacker = new() { UserID = 20, ID = 30 }; }
+public static class StringExtensions
+{
+    public static int GetStableHashCode(this string value) => value.GetHashCode(StringComparison.Ordinal);
+}
 public class Socket
 {
     public bool Connected = true;
@@ -81,12 +93,6 @@ public class ZNet : UnityEngine.Object
     public List<ZNetPeer> GetPeers() => Peers;
     public void Shutdown() { }
 }
-public static class Heightmap
-{
-    public enum Biome { None, BlackForest, Meadows }
-    public static Biome FindBiome(UnityEngine.Vector3 point) => point.x == -1 ? Biome.None :
-        point.x == 123 ? Biome.BlackForest : Biome.Meadows;
-}
 namespace BepInEx.Bootstrap
 {
     public class ConfigDefinition
@@ -98,6 +104,16 @@ namespace BepInEx.Bootstrap
     public class Plugin { public Dictionary<ConfigDefinition, ConfigEntry> Config = new(); }
     public class PluginInfo { public Plugin? Instance = new(); }
     public static class Chainloader { public static Dictionary<string, PluginInfo> PluginInfos = new(); }
+}
+namespace BepInEx.Configuration
+{
+    internal sealed class ConfigEntry<T>(T value) { public T Value { get; set; } = value; }
+    internal sealed class ConfigFile
+    {
+        public Dictionary<string, object> Values { get; } = new();
+        public ConfigEntry<T> Bind<T>(string section, string key, T value, string description) =>
+            new(Values.TryGetValue(section + "/" + key, out var configured) ? (T)configured : value);
+    }
 }
 namespace HarmonyLib
 {
@@ -120,18 +136,49 @@ namespace HarmonyLib
 }
 namespace DiscordConnector
 {
-    public class CombatConfig { public bool Enabled; }
     public class Logger
     {
         public List<string> Errors = new();
         public void LogError(string message) => Errors.Add(message);
+        public void LogWarning(string message) => Errors.Add(message);
     }
-    public class Database { public Records.CombatStore Combat = new(); }
     public static class DiscordConnectorPlugin
     {
-        public static CombatConfig StaticCombatConfig = new();
-        public static Database StaticDatabase = new();
         public static Logger StaticLogger = new();
+    }
+}
+namespace DiscordConnector.Patches
+{
+    // Only the cooking adapter seam is exercised here, not runtime sampling or ingress authentication.
+    internal sealed class ActivityRuntime
+    {
+        internal static ActivityRuntime? Current;
+        internal Records.CookingTracker Cooking = null!;
+        internal Records.LeaderboardsOptions Options = new(cookingCompletions: true);
+    }
+    internal static class StablePlayerResolver
+    {
+        internal static bool World(out string world)
+        {
+            world = ZNet.instance.GetWorldUID().ToString();
+            return ZNet.instance && ZNet.instance.IsServer() && ZNet.instance.IsDedicated() && ZNet.instance.GetWorldUID() != 0;
+        }
+        internal static bool Current(Records.ActivityActor actor) => actor.ConnectionToken == "connection";
+    }
+    internal static class ActivityPatches
+    {
+        internal sealed class Ingress
+        {
+            internal bool Failed, Data;
+            internal Records.ActivityActor? Actor;
+            internal int MethodHash = "RPC_AddItem".GetStableHashCode();
+            internal ZDOID Target;
+            internal long Sender = 7;
+            internal string CookingItem = "raw";
+        }
+        internal static Ingress? Sender;
+        internal static void Fail(Exception error) => throw new Exception("Cooking adapter failed", error);
+        internal static void Stage(Action capture, Action invalidate) => capture();
     }
 }
 namespace DiscordConnector.Records
@@ -141,18 +188,5 @@ namespace DiscordConnector.Records
         public string Id = "", WorldId = "", VictimId = "", PlayerId = "", PlayerName = "", Creature = "", Biome = "";
         public bool IsBoss;
         public DateTime TimestampUtc;
-    }
-    public class CombatStore
-    {
-        public Dictionary<string, CombatRecord> Records = new();
-        public bool Throw;
-        public int FailOnCall;
-        public int Calls;
-        public bool Insert(CombatRecord record)
-        {
-            Calls++;
-            if (Throw || Calls == FailOnCall) throw new InvalidOperationException("Secret/PII must not appear in logs");
-            return Records.TryAdd(record.Id, record);
-        }
     }
 }

@@ -14,6 +14,29 @@ namespace UnityEngine
     public static class Time { public static float realtimeSinceStartup; }
 }
 
+namespace BepInEx.Logging
+{
+    public class ManualLogSource
+    {
+        public List<(string Level, object Message)> Entries = new();
+        public Exception? InfoFailure;
+        public void LogInfo(object message)
+        {
+            if (InfoFailure != null) throw InfoFailure;
+            Entries.Add(("Info", message));
+        }
+        public void LogWarning(object message) => Entries.Add(("Warning", message));
+        public void LogError(object message) => Entries.Add(("Error", message));
+        public void LogFatal(object message) => Entries.Add(("Fatal", message));
+    }
+}
+
+public sealed class CapturingSynchronizationContext : SynchronizationContext
+{
+    public int Posts;
+    public override void Post(SendOrPostCallback callback, object? state) => Interlocked.Increment(ref Posts);
+}
+
 public enum OnlineBackendType { Steamworks, PlayFab }
 public class World { public string m_seedName = "world"; }
 public class PlayFabMatchmakingServerData

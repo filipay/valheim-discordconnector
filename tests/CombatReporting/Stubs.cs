@@ -9,7 +9,7 @@ namespace BepInEx.Configuration
     {
         public Dictionary<string, object> Values { get; } = new();
         public ConfigEntry<T> Bind<T>(string section, string key, T value, string description) =>
-            new(Values.TryGetValue(key, out object? configured) ? (T)configured : value);
+            new(Values.TryGetValue(section + "/" + key, out object? configured) || Values.TryGetValue(key, out configured) ? (T)configured : value);
     }
 }
 
@@ -27,13 +27,19 @@ namespace DiscordConnector
         internal List<string> Messages { get; } = new();
         internal void LogDebug(object? message) => Messages.Add(message?.ToString() ?? "");
         internal void LogInfo(object? message) => LogDebug(message);
-        internal void LogWarning(object? message) => LogDebug(message);
+        internal bool ThrowWarning;
+        internal void LogWarning(object? message)
+        {
+            LogDebug(message);
+            if (ThrowWarning) throw new InvalidOperationException("secret warning failure");
+        }
         internal void LogError(object? message) => LogDebug(message);
     }
 
     internal sealed class PluginConfig
     {
         public bool DiscordEmbedsEnabled { get; set; }
+        public bool DebugLeaderboardOperations { get; set; }
         // Empty URLs exercise the real serialization/routing path but return before HTTP dispatch.
         public WebhookEntry PrimaryWebhook { get; } = new("");
         public WebhookEntry SecondaryWebhook { get; } = new("", new());

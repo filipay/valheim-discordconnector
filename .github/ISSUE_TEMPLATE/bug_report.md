@@ -17,7 +17,7 @@ A clear and concise description of what you expected to happen.
 Upload the `config-dump.json` file from the Discord Connector config folder.
 
 **Logs**
-Upload the `vdc.log` file from the Discord Connector config folder.
+Upload BepInEx's `LogOutput.log` (or the relevant server console output). Redact webhook URLs, tokens and personal information before sharing.
 
 **Screenshots**
 If applicable, add screenshots to help explain your problem.

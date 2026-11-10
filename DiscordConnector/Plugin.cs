@@ -1,12 +1,13 @@
 using System;
-using System.Globalization;
 using System.IO;
+using System.Threading.Tasks;
 
 using BepInEx;
 
 using DiscordConnector.Common;
 using DiscordConnector.Config;
 using DiscordConnector.Leaderboards;
+using DiscordConnector.Patches;
 using DiscordConnector.Records;
 
 using HarmonyLib;
@@ -35,13 +36,41 @@ public class DiscordConnectorPlugin : BaseUnityPlugin
     private static string s_publicIpAddress = "";
     private Harmony? _harmony;
     private CombatReports? _combatReports;
+    private ManualLeaderboardReports? _manualReports;
+    private EmoteReportTriggers? _emoteTriggers;
+    private readonly ManualLeaderboardTriggerConfig _manualTriggerConfig;
+    private ActivityRuntime? _activityRuntime;
+    private NativeSignalCollector? _nativeSignals;
+    private readonly ActivityConfig _activityConfig;
+    private readonly ObservedLeaderboardsConfig _observedConfig;
     private DateTime _nextCombatReportCheckUtc;
+    private LeaderboardsOptions? _effectiveOptions;
+    private readonly DatabaseFailureBudget _stageFailures = new();
+    private ZNet? _sessionNet;
+    private World? _sessionWorld;
+    private ZDOMan? _sessionZdos;
+    private long _sessionServer;
+    private string _sessionWorldId = "", _sessionEpoch = "", _observationWorld = "";
+    private double _nextObservationCoverage, _nextObservationMaintenance;
+    private ActivityStore? _observationStore;
+    private Task _lossMaintenance = Task.CompletedTask;
+    private Task? _observationShutdown;
+    private bool _stopping, _cleanupFailed, _quitting;
 
     public DiscordConnectorPlugin()
     {
         StaticLogger = new VdcLogger(Logger, Path.Combine(Paths.ConfigPath, LegacyConfigPath));
         StaticConfig = new PluginConfig(Config);
         StaticCombatConfig = new CombatConfig(Config);
+        _activityConfig = new ActivityConfig(Config);
+        _observedConfig = new ObservedLeaderboardsConfig(Config);
+        _manualTriggerConfig = new ManualLeaderboardTriggerConfig(Config);
+        Config.SettingChanged += (_, _) =>
+        {
+            _effectiveOptions = null;
+            _nextObservationCoverage = 0;
+            NativeSignalPatches.InvalidateOptions();
+        };
         StaticDatabase = new Database(Paths.GameRootPath);
     }
 
@@ -62,6 +91,7 @@ public class DiscordConnectorPlugin : BaseUnityPlugin
 
     private void Awake()
     {
+        ManualReportDiagnostics.Current = new ManualReportDiagnostics(message => StaticLogger.LogInfo(message));
         // Plugin startup logic
         StaticLogger.LogDebug($"Plugin {ModName} is loaded!");
 
@@ -138,47 +168,235 @@ public class DiscordConnectorPlugin : BaseUnityPlugin
             playerActivityTimer.Start();
         }
 
+        var store = StaticDatabase.Activity;
+        _observationStore = store;
+        var collector = new ActivityCollector(store.Enqueue, message => StaticLogger.LogWarning(message), timeZoneId: StaticCombatConfig.TimeZoneId);
+        _nativeSignals = new NativeSignalCollector(store.Enqueue, message => StaticLogger.LogWarning(message));
+        NativeSignalPatches.Configure(_nativeSignals, EffectiveOptions);
+        _activityRuntime = new ActivityRuntime(collector, EffectiveOptions,
+            message => StaticLogger.LogWarning(message), store.CookingObservationEpoch,
+            explorationPauseReason: store.ExplorationPauseReason);
+        _manualReports = new ManualLeaderboardReports(StaticCombatConfig.TimeZoneId, StaticCombatConfig.TopCount,
+            (world, start, end) => store.QueryAsync(world, start, end, EffectiveOptions()), FlushObservations,
+            report => ManualReportDiagnostics.Dispatch(() => DiscordApi.SendRenderedMessage(Webhook.Event.LeaderboardsAll, report)),
+            message => StaticLogger.LogWarning(message), LogLeaderboardReport);
+        ActivityPatches.ManualCommand = RequestManualReport;
+        _emoteTriggers = new EmoteReportTriggers(_manualTriggerConfig.Enabled, _manualTriggerConfig.Daily, _manualTriggerConfig.Weekly,
+            message => StaticLogger.LogWarning(message));
+        ActivityPatches.EmoteTriggers = _emoteTriggers;
+
         if (StaticCombatConfig.DailyEnabled || StaticCombatConfig.WeeklyEnabled)
         {
             _combatReports = new CombatReports(StaticCombatConfig.DailyEnabled, StaticCombatConfig.WeeklyEnabled,
                 StaticCombatConfig.TimeZoneId, StaticCombatConfig.TopCount,
-                (world, start, end) => StaticDatabase.Combat.Query(world, start, end),
-                (id, now) => StaticDatabase.Combat.TryClaimReport(id, now),
-                message => DiscordApi.SendRenderedMessage(Webhook.Event.LeaderboardsAll, message),
-                message => StaticLogger.LogWarning(message));
+                (world, start, end) => store.QueryAsync(world, start, end, EffectiveOptions()),
+                store.TryClaimReportAsync, FlushObservations,
+                report => DiscordApi.SendRenderedMessage(Webhook.Event.LeaderboardsAll, report),
+                message => StaticLogger.LogWarning(message), LogLeaderboardReport);
         }
 
         _harmony = Harmony.CreateAndPatchAll(typeof(DiscordConnectorPlugin).Assembly, ModGuid);
+        ManualReportDiagnostics.Ready();
+    }
+
+    private static void LogLeaderboardReport(string message)
+    {
+        if (StaticConfig.DebugLeaderboardOperations) StaticLogger.LogInfo(message);
     }
 
     private void Update()
     {
-        if (_combatReports == null) return;
+        if (_stopping) return;
         DateTime nowUtc = DateTime.UtcNow;
-        if (nowUtc < _nextCombatReportCheckUtc) return;
-        _nextCombatReportCheckUtc = nowUtc.AddMinutes(1);
+        double monotonic = UnityEngine.Time.realtimeSinceStartupAsDouble;
+        try { ManualReportDiagnostics.Poll(); }
+        catch (Exception error) { LogStage("diagnostics", error); }
+        UpdateObservationState(nowUtc, monotonic);
+        UpdateReportState(nowUtc, monotonic, _observationWorld);
+    }
+
+    internal void UpdateObservationState(DateTime utc, double monotonic)
+    {
+        if (_stopping) return;
+        _observationWorld = "";
+        if (!double.IsNaN(monotonic) && !double.IsInfinity(monotonic) && monotonic >= _nextObservationMaintenance)
+        {
+            _nextObservationMaintenance = monotonic + 10;
+            try { if (_lossMaintenance.IsCompleted) _lossMaintenance = _observationStore?.MaintainLoss(monotonic) ?? Task.CompletedTask; }
+            catch (Exception error) { LogStage("loss-maintenance", error); }
+            try { _ = _observationStore?.MaintainSignalRetention(utc, monotonic); }
+            catch (Exception error) { LogStage("signal-retention", error); }
+        }
         try
         {
-            // Snapshot Unity state on the main thread; no pool timer may query world identity.
-            if (ZNet.instance == null || !ZNet.instance.IsServer() || !ZNet.instance.IsDedicated()) return;
-            if (ZNet.GetWorldIfIsHost() == null) return;
-            long worldUid = ZNet.instance.GetWorldUID();
-            if (worldUid != 0) _combatReports.Tick(nowUtc, worldUid.ToString(CultureInfo.InvariantCulture));
+            if (!StablePlayerResolver.World(out string world))
+            {
+                InvalidateObservationContext();
+                return;
+            }
+            long server = ZNet.GetUID();
+            if (_sessionWorldId != world || !ReferenceEquals(_sessionNet, ZNet.instance) ||
+                !ReferenceEquals(_sessionWorld, ZNet.World) || !ReferenceEquals(_sessionZdos, ZDOMan.instance) || _sessionServer != server)
+            {
+                NativeSignalPatches.SetWorld("");
+                _sessionNet = ZNet.instance; _sessionWorld = ZNet.World; _sessionZdos = ZDOMan.instance;
+                _sessionWorldId = world; _sessionServer = server; _sessionEpoch = Guid.NewGuid().ToString("N");
+                _nextObservationCoverage = 0;
+                try { _activityRuntime?.ResetSession(world); }
+                catch (Exception error) { LogStage("observation-session", error); }
+            }
+            NativeSignalPatches.SetSession(world, _sessionEpoch, ModGuid);
+            _observationWorld = world;
         }
-        catch (Exception ex)
+        catch (Exception error)
         {
-            _combatReports.Dispose();
-            _combatReports = null;
-            StaticLogger.LogWarning($"Combat reports disabled after world snapshot failure ({ex.GetType().Name}); tracking is unchanged.");
+            LogStage("world", error);
+            InvalidateObservationContext();
+            return;
+        }
+        try { _activityRuntime?.Update(utc, monotonic); }
+        catch (Exception error) { LogStage("observation-maintenance", error); }
+        if (monotonic >= _nextObservationCoverage)
+        {
+            _nextObservationCoverage = monotonic + 1;
+            try { NativeSignalPatches.UpdateCoverage(utc); }
+            catch (Exception error) { LogStage("native-coverage", error); }
         }
     }
 
-    private void OnDestroy()
+    private void InvalidateObservationContext()
     {
-        _combatReports?.Dispose();
-        _combatReports = null;
-        StaticDatabase.Dispose();
-        _harmony?.UnpatchSelf();
+        _observationWorld = ""; _nextObservationCoverage = 0;
+        try { NativeSignalPatches.SetWorld(""); }
+        catch (Exception error) { LogStage("native-invalidate", error); }
+        try { _activityRuntime?.Suspend(); }
+        catch (Exception error) { LogStage("observation-invalidate", error); }
+    }
+
+    internal void UpdateReportState(DateTime utc, double monotonic, string world)
+    {
+        if (_stopping || world.Length == 0) return;
+        try { _emoteTriggers?.SetEnabled(_manualTriggerConfig.Enabled); _emoteTriggers?.SetWorld(world); }
+        catch (Exception error) { LogStage("manual-context", error); }
+        try { _manualReports?.Poll(monotonic, world); }
+        catch (Exception error) { LogStage("manual-poll", error); }
+        try { _combatReports?.Poll(utc, world); }
+        catch (Exception error) { LogStage("automatic-poll", error); }
+        if (_combatReports == null || utc < _nextCombatReportCheckUtc) return;
+        try { _nextCombatReportCheckUtc = utc.AddMinutes(1); _combatReports.Tick(utc, world); }
+        catch (Exception error) { LogStage("automatic-tick", error); }
+    }
+
+    private void LogStage(string stage, Exception error)
+    {
+        try
+        {
+            if (_stageFailures.TryTake(error, System.Diagnostics.Stopwatch.GetTimestamp() / System.Diagnostics.Stopwatch.Frequency, out long suppressed))
+                StaticLogger.LogWarning($"Observation failure stage={stage} suppressed={suppressed} " + DatabaseDiagnostics.Describe(error));
+        }
+        catch { /* Logging must not prevent the next stage or shutdown sealing. */ }
+    }
+
+    private void RequestManualReport(ZRpc rpc, ActivityActor captured, string world, string text)
+    {
+        try
+        {
+            // Use the current transport socket and native platform-aware admin policy, never chat UserInfo/name.
+            bool sameWorld = StablePlayerResolver.World(out string currentWorld) && currentWorld == world;
+            bool samePeer = false;
+            ActivityActor? current = null;
+            if (sameWorld)
+                samePeer = StablePlayerResolver.Transport(rpc, DateTime.UtcNow, out var peer, out current) && peer != null && current != null &&
+                    ReferenceEquals(rpc.GetSocket(), peer.m_socket) &&
+                    current.ConnectionToken == captured.ConnectionToken && current.PlayerId == captured.PlayerId;
+            bool authorized = samePeer && ZNet.instance.IsAdmin(current!.PlayerId);
+            ManualReportDiagnostics.Emit(ManualReportStage.Authorization, !sameWorld ? ManualReportReason.InvalidWorld :
+                !samePeer ? ManualReportReason.InvalidIngress : authorized ? ManualReportReason.Passed : ManualReportReason.Denied);
+            if (_manualReports == null) ManualReportDiagnostics.Emit(ManualReportStage.Callback, ManualReportReason.Disposed);
+            _manualReports?.Request(text, authorized, DateTime.UtcNow, UnityEngine.Time.realtimeSinceStartupAsDouble, world);
+        }
+        catch (Exception error)
+        {
+            ManualReportDiagnostics.Emit(ManualReportStage.Authorization, ManualReportReason.Failed, error);
+            StaticLogger.LogWarning($"Manual preview authorization failed ({error.GetType().Name}); no report requested.");
+        }
+    }
+
+    private LeaderboardsOptions EffectiveOptions() => _effectiveOptions ??= _observedConfig.Snapshot(_activityConfig);
+
+    private string[] FlushObservations(DateTime endUtc)
+    {
+        NativeSignalPatches.UpdateCoverage(DateTime.UtcNow);
+        return _activityRuntime?.FlushThrough(endUtc) ?? Array.Empty<string>();
+    }
+
+    private void OnDestroy() => _ = BeginObservationShutdown();
+
+    private void OnApplicationQuit()
+    {
+        if (_quitting) return;
+        _quitting = true;
+        try
+        {
+            if (!BeginObservationShutdown().Wait(TimeSpan.FromSeconds(5)))
+                StaticLogger.LogWarning("Observation shutdown timed out after 5 seconds; pending writes may be lost on exit. The database remains owned by its drain worker.");
+        }
+        catch (Exception error) { LogStage("quit-drain", error); }
+    }
+
+    internal Task BeginObservationShutdown()
+    {
+        if (_observationShutdown != null) return _observationShutdown;
+        _stopping = true;
+        try
+        {
+            Cleanup("native-stop", NativeSignalPatches.Stop);
+            Cleanup("native-dispose", () => _nativeSignals?.Dispose());
+            _nativeSignals = null;
+            ActivityPatches.EmoteTriggers = null; ActivityPatches.ManualCommand = null;
+            Cleanup("emote-dispose", () => _emoteTriggers?.Dispose());
+            _emoteTriggers = null;
+            Cleanup("manual-dispose", () => _manualReports?.Dispose());
+            _manualReports = null;
+            Cleanup("automatic-dispose", () => _combatReports?.Dispose());
+            _combatReports = null;
+            Cleanup("observation-flush", () => _activityRuntime?.FlushThrough(DateTime.UtcNow));
+            Cleanup("observation-dispose", () => _activityRuntime?.Dispose());
+            _activityRuntime = null;
+        }
+        finally
+        {
+            if (!_quitting) Cleanup("unpatch", () => _harmony?.UnpatchSelf());
+            ManualReportDiagnostics.Current = null;
+            Task finalLoss = Task.CompletedTask;
+            try
+            {
+                finalLoss = _observationStore?.SubmitLossBeforeSeal(UnityEngine.Time.realtimeSinceStartupAsDouble) ?? Task.CompletedTask;
+            }
+            catch (Exception error) { _cleanupFailed = true; LogStage("loss-final", error); }
+            finally
+            {
+                // Sealing is synchronous; only pool continuations observe drain and acknowledgment bookkeeping.
+                Task drain = StaticDatabase.BeginShutdown();
+                _observationShutdown = Task.WhenAll(drain, _lossMaintenance, finalLoss).ContinueWith(completed =>
+                {
+                    if (completed.Exception != null) LogStage("shutdown-drain", completed.Exception.GetBaseException());
+                    try
+                    {
+                        var loss = _observationStore?.Loss;
+                        StaticLogger.LogWarning(FormattableString.Invariant($"Observation shutdown state=drained cleanupFailed={_cleanupFailed} drainFailed={completed.Status != TaskStatus.RanToCompletion} lossUnacknowledged={loss?.UnacknowledgedKeys ?? 0} lossIncomplete={loss?.Incomplete ?? false}; drain is not an all-writes-successful or exit-durability guarantee."));
+                    }
+                    catch { }
+                }, System.Threading.CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+            }
+        }
+        return _observationShutdown!;
+    }
+
+    private void Cleanup(string stage, Action cleanup)
+    {
+        try { cleanup(); }
+        catch (Exception error) { _cleanupFailed = true; LogStage(stage, error); }
     }
 
     /// <summary>
