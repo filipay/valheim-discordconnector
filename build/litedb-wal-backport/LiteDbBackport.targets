@@ -1,0 +1,33 @@
+<Project>
+  <!-- Import explicitly for testing builds only; normal PackageReference builds stay unchanged. -->
+  <Target Name="ValidateLiteDbBackportPath" BeforeTargets="PrepareForBuild;ResolvePackageAssets">
+    <Error Condition="'$(LiteDbBackportPath)' == '' or !Exists('$(LiteDbBackportPath)')"
+           Text="Testing backport requires LiteDbBackportPath pointing to the source-built LiteDB.dll." />
+    <PropertyGroup>
+      <LiteDbBackportPath>$([System.IO.Path]::GetFullPath('$(LiteDbBackportPath)'))</LiteDbBackportPath>
+    </PropertyGroup>
+  </Target>
+  <Target Name="SelectLiteDbBackport" AfterTargets="ResolvePackageAssets" DependsOnTargets="ValidateLiteDbBackportPath">
+    <ItemGroup>
+      <_LiteDbOriginalAsset Include="@(ResolvedCompileFileDefinitions)" Condition="'%(Filename)' == 'LiteDB'" />
+      <ResolvedCompileFileDefinitions Remove="@(_LiteDbOriginalAsset)" />
+      <RuntimeCopyLocalItems Remove="@(RuntimeCopyLocalItems)" Condition="'%(Filename)' == 'LiteDB'" />
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'LiteDB'" />
+      <Reference Include="LiteDB" Condition="'@(_LiteDbOriginalAsset)' != ''">
+        <HintPath>$(LiteDbBackportPath)</HintPath>
+        <Private>true</Private>
+      </Reference>
+    </ItemGroup>
+  </Target>
+  <Target Name="VerifyLiteDbBackportResolution" AfterTargets="ResolveAssemblyReferences" Condition="'@(_LiteDbOriginalAsset)' != ''">
+    <ItemGroup>
+      <_LiteDbCompile Include="@(ReferencePath)" Condition="'%(Filename)' == 'LiteDB'" />
+      <_LiteDbCopy Include="@(ReferenceCopyLocalPaths)" Condition="'%(Filename)' == 'LiteDB' and '%(Extension)' == '.dll'" />
+    </ItemGroup>
+    <Error Condition="'@(_LiteDbCompile->Count())' != '1' or '@(_LiteDbCompile)' != '$(LiteDbBackportPath)'"
+           Text="Compile reference did not resolve exclusively to LiteDbBackportPath: @(_LiteDbCompile)" />
+    <Error Condition="'@(_LiteDbCopy->Count())' != '1' or '@(_LiteDbCopy)' != '$(LiteDbBackportPath)'"
+           Text="CopyLocal did not resolve exclusively to LiteDbBackportPath: @(_LiteDbCopy)" />
+    <Message Importance="high" Text="TESTING ONLY: LiteDB compile/CopyLocal = $(LiteDbBackportPath)" />
+  </Target>
+</Project>

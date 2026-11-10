@@ -5,6 +5,8 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 
+using DiscordConnector.Leaderboards;
+
 using Newtonsoft.Json;
 
 using UnityEngine;
@@ -114,6 +116,54 @@ internal class DiscordApi
             DiscordConnectorPlugin.StaticLogger.LogError($"Error sending message: {ex.Message}");
             DiscordConnectorPlugin.StaticLogger.LogDebug(ex.StackTrace);
         }
+    }
+
+    // Caller has already escaped and bounded the report; do not expand templates or add configured embed text.
+    internal static void SendRenderedMessage(Webhook.Event ev, LeaderboardReport report)
+    {
+        DiscordExecuteWebhook payload = new()
+        {
+            content = report.PlainText,
+            allowed_mentions = new AllowedMentions { parse = [], roles = [], users = [], replied_user = false }
+        };
+        if (DiscordConnectorPlugin.StaticConfig.DiscordEmbedsEnabled)
+        {
+            try
+            {
+                payload.embeds = [CreateRenderedReportEmbed(report)];
+                payload.content = null;
+            }
+            catch
+            {
+                // Keep the original bounded text and mention protection if presentation fails.
+                DiscordConnectorPlugin.StaticLogger.LogWarning("Leaderboard report embed construction failed; sending plain text.");
+            }
+        }
+        payload.SendFor(ev);
+    }
+
+    private static DiscordEmbed CreateRenderedReportEmbed(LeaderboardReport report)
+    {
+        // Reuse the leaderboard color conversion without template expansion or configurable text suppression.
+        DiscordEmbed embed = new EmbedBuilder().SetColor(DiscordConnectorPlugin.StaticConfig.EmbedLeaderboardEmbedColor).Build();
+        embed.title = "🏆 " + report.Title;
+        embed.description = report.Description;
+        if (report.Footer.Length != 0) embed.footer = new DiscordEmbedFooter { text = report.Footer };
+        embed.fields = new List<DiscordField>();
+        foreach (var section in report.Sections)
+        {
+            embed.fields.Add(new DiscordField
+            {
+                name = section.Heading,
+                value = section.Value,
+                inline = false
+            });
+        }
+        int total = embed.title.Length + embed.description.Length + report.Footer.Length + embed.fields.Sum(field => field.name!.Length + field.value!.Length);
+        if (report.PlainText.Length > 1900 || embed.title.Length > 256 || embed.description.Length > 4096 || report.Footer.Length > 2048 || embed.fields.Count > 25 || total > 6000 ||
+            embed.fields.Any(field => field.name!.Length == 0 || field.name.Length > 256 || field.value!.Length == 0 || field.value.Length > 1024))
+            throw new InvalidOperationException("Rendered report exceeds embed limits.");
+        return embed;
     }
 
     /// <summary>
@@ -704,6 +754,7 @@ internal class DiscordExecuteWebhook
     /// <param name="ev">The event that triggered this message</param>
     public void SendFor(Webhook.Event ev)
     {
+        int matched = 0, invoked = 0;
         // If the object is not valid, do not send it
         if (!IsValid())
         {
@@ -717,6 +768,7 @@ internal class DiscordExecuteWebhook
         {
             if (DiscordConnectorPlugin.StaticConfig.PrimaryWebhook.HasEvent(ev))
             {
+                if (matched < int.MaxValue) matched++;
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"Sending {ev} message to Primary Webhook");
                 WebhookEntry primaryWebhook = DiscordConnectorPlugin.StaticConfig.PrimaryWebhook;
                 ResetOverrides();
@@ -731,11 +783,14 @@ internal class DiscordExecuteWebhook
                     SetAvatarUrl(primaryWebhook.AvatarOverride);
                 }
 
-                DiscordApi.SendSerializedJson(primaryWebhook, JsonConvert.SerializeObject(this));
+                string json = JsonConvert.SerializeObject(this);
+                if (invoked < int.MaxValue) invoked++;
+                DiscordApi.SendSerializedJson(primaryWebhook, json);
             }
 
             if (DiscordConnectorPlugin.StaticConfig.SecondaryWebhook.HasEvent(ev))
             {
+                if (matched < int.MaxValue) matched++;
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"Sending {ev} message to Secondary Webhook");
                 WebhookEntry secondaryWebhook = DiscordConnectorPlugin.StaticConfig.SecondaryWebhook;
                 ResetOverrides();
@@ -750,13 +805,16 @@ internal class DiscordExecuteWebhook
                     SetAvatarUrl(secondaryWebhook.AvatarOverride);
                 }
 
-                DiscordApi.SendSerializedJson(secondaryWebhook, JsonConvert.SerializeObject(this));
+                string json = JsonConvert.SerializeObject(this);
+                if (invoked < int.MaxValue) invoked++;
+                DiscordApi.SendSerializedJson(secondaryWebhook, json);
             }
 
             foreach (WebhookEntry webhook in DiscordConnectorPlugin.StaticConfig.ExtraWebhooks)
             {
                 if (webhook.HasEvent(ev))
                 {
+                    if (matched < int.MaxValue) matched++;
                     DiscordConnectorPlugin.StaticLogger.LogDebug($"Sending {ev} message to an Extra Webhook");
                     ResetOverrides();
 
@@ -770,13 +828,21 @@ internal class DiscordExecuteWebhook
                         SetAvatarUrl(webhook.AvatarOverride);
                     }
 
-                    DiscordApi.SendSerializedJson(webhook, JsonConvert.SerializeObject(this));
+                    string json = JsonConvert.SerializeObject(this);
+                    if (invoked < int.MaxValue) invoked++;
+                    DiscordApi.SendSerializedJson(webhook, json);
                 }
             }
         }
         catch (Exception e)
         {
+            if (ManualReportDiagnostics.InDispatch) ManualReportDiagnostics.Emit(ManualReportStage.Routing, ManualReportReason.Failed, e);
             DiscordConnectorPlugin.StaticLogger.LogWarning($"Error serializing payload: {e}");
+        }
+        finally
+        {
+            if (ManualReportDiagnostics.InDispatch)
+                ManualReportDiagnostics.Emit(ManualReportStage.Routing, ManualReportReason.DispatchCounts, matched: matched, invoked: invoked);
         }
     }
     // ! Any additional fields are also left out, as they are not used in this plugin.

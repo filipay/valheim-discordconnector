@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 using BepInEx;
@@ -22,7 +23,16 @@ namespace DiscordConnector.Records;
 internal class Database
 {
     private const string DB_NAME = "records.db";
-    private static string DbPath = "";
+    private readonly string DbPath;
+    private readonly object lifecycle = new();
+    private readonly object legacyAccess = new();
+    private readonly DatabaseDiagnostics diagnostics = new(message => DiscordConnectorPlugin.StaticLogger.LogWarning(message));
+    private Task? initialization;
+    private Task? shutdown;
+    private Task legacyTail = Task.CompletedTask;
+    private CombatStore? combat;
+    private ActivityStore? activity;
+    private volatile bool disposed;
     private LiteDatabase db;
     private ILiteCollection<SimpleStat> DeathCollection;
     private ILiteCollection<SimpleStat> JoinCollection;
@@ -30,6 +40,38 @@ internal class Database
     private ILiteCollection<SimpleStat> PingCollection;
     private ILiteCollection<PlayerToName> PlayerToNameCollection;
     private ILiteCollection<SimpleStat> ShoutCollection;
+
+    internal CombatStore Combat
+    {
+        get
+        {
+            WaitForInitialization();
+            return combat!;
+        }
+    }
+
+    internal ActivityStore Activity
+    {
+        get
+        {
+            WaitForInitialization();
+            return activity!;
+        }
+    }
+
+    private void WaitForInitialization()
+    {
+        Task ready;
+        lock (lifecycle)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(Database));
+            ready = initialization!;
+        }
+        try { ready.GetAwaiter().GetResult(); }
+        catch (Exception exception) { throw new InvalidOperationException("Combat database initialization failed.", exception); }
+        lock (lifecycle)
+            if (disposed) throw new ObjectDisposedException(nameof(Database));
+    }
 
     /// <summary>
     ///     Sets up the database path and initializes the database connection.
@@ -64,9 +106,11 @@ internal class Database
     /// </summary>
     public void Initialize()
     {
-        Task.Run(() =>
+        lock (lifecycle)
         {
-            try
+            if (disposed) throw new ObjectDisposedException(nameof(Database));
+            if (initialization != null) return;
+            initialization = Task.Run(() =>
             {
                 db = new LiteDatabase(DbPath);
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"LiteDB Connection Established to {DbPath}");
@@ -79,19 +123,16 @@ internal class Database
                 PingCollection = db.GetCollection<SimpleStat>("pings");
                 PlayerToNameCollection = db.GetCollection<PlayerToName>("player_name");
 
-                // Ensure indices on the collections
-                Task.Run(() =>
-                {
-                    EnsureIndicesOnCollections();
-                    DiscordConnectorPlugin.StaticLogger.LogDebug("Created indices on database collections");
-                }).ConfigureAwait(false);
-            }
-            catch (IOException e)
-            {
-                DiscordConnectorPlugin.StaticLogger.LogError($"Unable to acquire un-shared access to {DbPath}");
-                DiscordConnectorPlugin.StaticLogger.LogDebug(e.ToString());
-            }
-        }).ConfigureAwait(false);
+                EnsureIndicesOnCollections();
+                DiscordConnectorPlugin.StaticLogger.LogDebug("Created indices on database collections");
+                combat = new CombatStore(db);
+                PlayerActionStore participants = new(db);
+                CookingStore cooking = new(db, diagnostics);
+                activity = new ActivityStore(db, combat, participants, cooking,
+                    message => DiscordConnectorPlugin.StaticLogger.LogWarning(message), diagnostics);
+            });
+            ObserveFailure(initialization, DatabaseStage.Drain);
+        }
     }
 
     /// <summary>
@@ -114,13 +155,89 @@ internal class Database
     }
 
     /// <summary>
-    ///     Closes the database connection nicely.
+    ///     Seals admissions without waiting on I/O. The owned pool worker drains before closing LiteDB.
     /// </summary>
-    public void Dispose()
+    internal Task BeginShutdown()
     {
-        if (db == null) return;
-        DiscordConnectorPlugin.StaticLogger.LogDebug("Closing LiteDB connection");
-        db.Dispose();
+        lock (lifecycle)
+        {
+            if (shutdown != null) return shutdown;
+            disposed = true;
+            Task ready = initialization ?? Task.CompletedTask;
+            Task writes = legacyTail;
+            Task? drain = activity?.BeginDrain();
+            var pending = activity?.PendingWork ?? (Batches: 0, Reports: 0);
+            diagnostics.Shutdown("sealing", pending.Batches, pending.Reports,
+                activity?.Loss.UnacknowledgedKeys ?? 0, activity?.Loss.Incomplete ?? false);
+            shutdown = Task.Run(async () =>
+            {
+                try
+                {
+                    try { await ready.ConfigureAwait(false); }
+                    catch (Exception) when (ready.IsFaulted)
+                    {
+                        // The initialization task is observed separately; close any partially opened handle below.
+                        diagnostics.Report(DatabaseStage.Drain, ready.Exception!.GetBaseException(), disposed: true);
+                    }
+                    drain ??= activity?.BeginDrain() ?? Task.CompletedTask;
+                    try { await Task.WhenAll(writes, drain).ConfigureAwait(false); }
+                    catch (Exception error) { diagnostics.Report(DatabaseStage.Drain, error, disposed: true); throw; }
+                }
+                finally
+                {
+                    // Only the worker waits for admitted synchronous readers, never the plugin thread.
+                    try { lock (legacyAccess) db?.Dispose(); }
+                    catch (Exception error) { diagnostics.Report(DatabaseStage.Drain, error, disposed: true); throw; }
+                    finally
+                    {
+                        var remaining = activity?.PendingWork ?? (Batches: 0, Reports: 0);
+                        diagnostics.Shutdown("drained", remaining.Batches, remaining.Reports,
+                            activity?.Loss.UnacknowledgedKeys ?? 0, activity?.Loss.Incomplete ?? false);
+                    }
+                }
+            });
+            ObserveFailure(shutdown, DatabaseStage.Drain);
+            return shutdown;
+        }
+    }
+
+    // Synchronous completion is retained for non-Unity callers that immediately reopen the file.
+    public void Dispose() => BeginShutdown().GetAwaiter().GetResult();
+
+    private void ObserveFailure(Task task, DatabaseStage stage) =>
+        _ = task.ContinueWith(failed =>
+        {
+            foreach (Exception exception in failed.Exception!.InnerExceptions)
+                diagnostics.Report(stage, exception, disposed: disposed);
+        }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
+    private bool QueueLegacyWrite(Action write)
+    {
+        lock (lifecycle)
+        {
+            if (disposed) return false;
+            Task ready = initialization!;
+            legacyTail = legacyTail.ContinueWith(async _ =>
+            {
+                try { await ready.ConfigureAwait(false); write(); }
+                catch (Exception error) { diagnostics.Report(DatabaseStage.Legacy, error, disposed: disposed); throw; }
+            }, TaskScheduler.Default).Unwrap();
+            _ = legacyTail.ContinueWith(failed => { _ = failed.Exception; }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            return true;
+        }
+    }
+
+    private T ReadLegacy<T>(Func<T> read)
+    {
+        // Grouped queries resolve names through this same database, on the admitted reader's thread.
+        if (Monitor.IsEntered(legacyAccess)) return read();
+        WaitForInitialization();
+        lock (legacyAccess)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(Database));
+            return read();
+        }
     }
 
     /// <summary>
@@ -133,15 +250,8 @@ internal class Database
     private void InsertSimpleStatRecord(ILiteCollection<SimpleStat> collection, string playerName,
         string playerHostName, Vector3 pos)
     {
-        Task.Run(() =>
-        {
-            SimpleStat newRecord = new(
-                playerName,
-                playerHostName,
-                pos.x, pos.y, pos.z
-            );
-            collection.Insert(newRecord);
-        }).ConfigureAwait(false);
+        SimpleStat newRecord = new(playerName, playerHostName, pos.x, pos.y, pos.z);
+        collection.Insert(newRecord);
     }
 
     /// <summary>
@@ -151,26 +261,23 @@ internal class Database
     /// <param name="playerHostName">Player's connection hostname</param>
     private void EnsurePlayerNameRecorded(string characterName, string playerHostName)
     {
-        Task.Run(() =>
+        if (PlayerToNameCollection.Exists(x =>
+                x.PlayerId.Equals(playerHostName) && x.CharacterName.Equals(characterName)))
         {
-            if (PlayerToNameCollection.Exists(x =>
-                    x.PlayerId.Equals(playerHostName) && x.CharacterName.Equals(characterName)))
-            {
-                // If the player record exists with both playerHostName and characterName, do nothing.
-                return;
-            }
+            // If the player record exists with both playerHostName and characterName, do nothing.
+            return;
+        }
 
-            if (PlayerToNameCollection.Exists(x => x.PlayerId.Equals(playerHostName)))
-            {
-                // If the player record exists but only with the playerHostName, a new "latest" name is here
-                DiscordConnectorPlugin.StaticLogger.LogDebug(
-                    $"Multiple characters from {playerHostName}, latest is {characterName}");
-            }
+        if (PlayerToNameCollection.Exists(x => x.PlayerId.Equals(playerHostName)))
+        {
+            // If the player record exists but only with the playerHostName, a new "latest" name is here
+            DiscordConnectorPlugin.StaticLogger.LogDebug(
+                $"Multiple characters from {playerHostName}, latest is {characterName}");
+        }
 
-            // Insert the player name record if it doesn't exist
-            PlayerToName newPlayer = new(characterName, playerHostName);
-            PlayerToNameCollection.Insert(newPlayer);
-        }).ConfigureAwait(false);
+        // Insert the player name record if it doesn't exist
+        PlayerToName newPlayer = new(characterName, playerHostName);
+        PlayerToNameCollection.Insert(newPlayer);
     }
 
     /// <summary>
@@ -194,28 +301,31 @@ internal class Database
     /// <param name="pos">World position to record with the stat</param>
     public void InsertSimpleStatRecord(string key, string playerName, string playerHostName, Vector3 pos)
     {
-        switch (key)
+        if (!QueueLegacyWrite(() =>
         {
-            case Categories.Death:
-                InsertSimpleStatRecord(DeathCollection, playerName, playerHostName, pos);
-                break;
-            case Categories.Join:
-                EnsurePlayerNameRecorded(playerName, playerHostName);
-                InsertSimpleStatRecord(JoinCollection, playerName, playerHostName, pos);
-                break;
-            case Categories.Leave:
-                InsertSimpleStatRecord(LeaveCollection, playerName, playerHostName, pos);
-                break;
-            case Categories.Ping:
-                InsertSimpleStatRecord(PingCollection, playerName, playerHostName, pos);
-                break;
-            case Categories.Shout:
-                InsertSimpleStatRecord(ShoutCollection, playerName, playerHostName, pos);
-                break;
-            default:
-                DiscordConnectorPlugin.StaticLogger.LogDebug($"InsertSimpleStatRecord, invalid key '{key}'");
-                break;
-        }
+            switch (key)
+            {
+                case Categories.Death:
+                    InsertSimpleStatRecord(DeathCollection, playerName, playerHostName, pos);
+                    break;
+                case Categories.Join:
+                    EnsurePlayerNameRecorded(playerName, playerHostName);
+                    InsertSimpleStatRecord(JoinCollection, playerName, playerHostName, pos);
+                    break;
+                case Categories.Leave:
+                    InsertSimpleStatRecord(LeaveCollection, playerName, playerHostName, pos);
+                    break;
+                case Categories.Ping:
+                    InsertSimpleStatRecord(PingCollection, playerName, playerHostName, pos);
+                    break;
+                case Categories.Shout:
+                    InsertSimpleStatRecord(ShoutCollection, playerName, playerHostName, pos);
+                    break;
+                default:
+                    DiscordConnectorPlugin.StaticLogger.LogDebug($"InsertSimpleStatRecord, invalid key '{key}'");
+                    break;
+            }
+        })) throw new ObjectDisposedException(nameof(Database));
     }
 
     /// <summary>
@@ -239,7 +349,7 @@ internal class Database
     /// </summary>
     /// <param name="playerHostName">The player's connection host name</param>
     /// <returns>Last known character name of the player</returns>
-    internal string GetLatestCharacterNameForPlayer(string playerHostName)
+    internal string GetLatestCharacterNameForPlayer(string playerHostName) => ReadLegacy(() =>
     {
         if (DiscordConnectorPlugin.StaticConfig.DebugDatabaseMethods)
         {
@@ -298,14 +408,11 @@ internal class Database
                 $"GetLatestNameForCharacterId {playerHostName} result = {result}");
         }
 
-        Task.Run(() =>
-        {
-            // Insert the player name, since we didn't have it in the player_name database!
-            EnsurePlayerNameRecorded(result["Name"], playerHostName);
-        }).ConfigureAwait(false);
+        // Backfill only while writes are still admitted; the current reader can finish during shutdown.
+        QueueLegacyWrite(() => EnsurePlayerNameRecorded(result["Name"], playerHostName));
 
         return result["Name"].AsString;
-    }
+    });
 
 
     /// <summary>
@@ -313,7 +420,7 @@ internal class Database
     /// </summary>
     /// <param name="key">Record type to return sums for</param>
     /// <returns>List of results with character names and totals</returns>
-    public List<CountResult> CountAllRecordsGrouped(string key)
+    public List<CountResult> CountAllRecordsGrouped(string key) => ReadLegacy(() =>
     {
         switch (key)
         {
@@ -333,7 +440,7 @@ internal class Database
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"CountAllRecordsGrouped, invalid key '{key}'");
                 return new List<CountResult>();
         }
-    }
+    });
 
     /// <summary>
     ///     Provides time online in seconds for all players within the date range provided. By default, it includes all time.
@@ -439,7 +546,7 @@ internal class Database
     /// <param name="key"></param>
     /// <param name="playerName"></param>
     /// <returns></returns>
-    public int CountOfRecordsByName(string key, string playerName)
+    public int CountOfRecordsByName(string key, string playerName) => ReadLegacy(() =>
     {
         if (!DiscordConnectorPlugin.StaticConfig.CollectStatsEnabled)
         {
@@ -462,7 +569,7 @@ internal class Database
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"CountOfRecordsBySteamId, invalid key '{key}'");
                 return -2;
         }
-    }
+    });
 
     public List<CountResult> CountAllRecordsGrouped(string key, TimeRange timeRange)
     {
@@ -476,7 +583,7 @@ internal class Database
     }
 
     internal List<CountResult> CountRecordsBetweenDatesGrouped(string key, DateTime startDate, DateTime endDate,
-        bool inclusiveStart = true, bool inclusiveEnd = true)
+        bool inclusiveStart = true, bool inclusiveEnd = true) => ReadLegacy(() =>
     {
         switch (key)
         {
@@ -499,9 +606,9 @@ internal class Database
                 DiscordConnectorPlugin.StaticLogger.LogDebug($"CountTodaysRecordsGrouped, invalid key '{key}'");
                 return [];
         }
-    }
+    });
 
-    internal int CountOfRecordsByName(ILiteCollection<SimpleStat> collection, string playerName)
+    internal int CountOfRecordsByName(ILiteCollection<SimpleStat> collection, string playerName) => ReadLegacy(() =>
     {
         try
         {
@@ -519,7 +626,7 @@ internal class Database
             DiscordConnectorPlugin.StaticLogger.LogDebug($"Error when trying to find {playerName} to count!");
             return -3;
         }
-    }
+    });
 
     /// <summary>
     ///     Return a list of leaders for the collection.
@@ -528,7 +635,7 @@ internal class Database
     /// </summary>
     /// <param name="collection">Simple stat collection to count player totals in</param>
     /// <returns>List of counts with CharacterName and Total (x) for the provided SimpleStat collection.</returns>
-    internal List<CountResult> CountAllRecordsGrouped(ILiteCollection<SimpleStat> collection)
+    internal List<CountResult> CountAllRecordsGrouped(ILiteCollection<SimpleStat> collection) => ReadLegacy(() =>
     {
         if (DiscordConnectorPlugin.StaticConfig.DebugDatabaseMethods)
         {
@@ -577,7 +684,7 @@ internal class Database
         }
 
         return result;
-    }
+    });
 
 
     /// <summary>
@@ -596,7 +703,7 @@ internal class Database
     ///     Whether to include the end date or not in the returned results. If true, it will use `<=` for the startDate comparison; otherwise `<`.</param>
     /// <returns>List of counts with CharacterName and Total (x) for the provided SimpleStat collection.</returns>
     internal List<CountResult> CountAllRecordsGroupsWhereDate(ILiteCollection<SimpleStat> collection,
-        DateTime startDate, DateTime endDate, bool inclusiveStart = true, bool inclusiveEnd = true)
+        DateTime startDate, DateTime endDate, bool inclusiveStart = true, bool inclusiveEnd = true) => ReadLegacy(() =>
     {
         if (DiscordConnectorPlugin.StaticConfig.DebugDatabaseMethods)
         {
@@ -705,7 +812,7 @@ internal class Database
         }
 
         return result;
-    }
+    });
 
     private struct JoinLeaveTime
     {

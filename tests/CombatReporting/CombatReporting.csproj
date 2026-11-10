@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="LiteDB" Version="5.0.21" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <Compile Include="../../DiscordConnector/Config/CombatConfig.cs" Link="CombatConfig.cs" />
+    <Compile Include="../../DiscordConnector/Config/ActivityConfig.cs" Link="ActivityConfig.cs" />
+    <Compile Include="../../DiscordConnector/Config/ManualLeaderboardTriggerConfig.cs" Link="ManualLeaderboardTriggerConfig.cs" />
+    <Compile Include="../../DiscordConnector/Config/ObservedLeaderboardsConfig.cs" Link="ObservedLeaderboardsConfig.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/CombatReports.cs" Link="CombatReports.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/LeaderboardReport.cs" Link="LeaderboardReport.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/ManualLeaderboardReports.cs" Link="ManualLeaderboardReports.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/ManualReportDiagnostics.cs" Link="ManualReportDiagnostics.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/ManualCommandRouting.cs" Link="ManualCommandRouting.cs" />
+    <Compile Include="../../DiscordConnector/Leaderboards/EmoteReportTriggers.cs" Link="EmoteReportTriggers.cs" />
+    <Compile Include="../../DiscordConnector/Records/CombatRecord.cs" Link="CombatRecord.cs" />
+    <Compile Include="../../DiscordConnector/Records/CombatStore.cs" Link="CombatStore.cs" />
+    <Compile Include="../../DiscordConnector/Records/ActivityModels.cs" Link="ActivityModels.cs" />
+    <Compile Include="../../DiscordConnector/Records/ObservationAdmission.cs" Link="ObservationAdmission.cs" />
+    <Compile Include="../../DiscordConnector/Records/ObservationLoss.cs" Link="ObservationLoss.cs" />
+    <Compile Include="../../DiscordConnector/Records/ReportedSignalRecord.cs" Link="ReportedSignalRecord.cs" />
+    <Compile Include="../../DiscordConnector/Records/ReportedSignalStore.cs" Link="ReportedSignalStore.cs" />
+    <Compile Include="../../DiscordConnector/Records/PlayerActionRecord.cs" Link="PlayerActionRecord.cs" />
+    <Compile Include="../../DiscordConnector/Records/CookingRecord.cs" Link="CookingRecord.cs" />
+    <Compile Include="../../DiscordConnector/Records/PlayerActionStore.cs" Link="PlayerActionStore.cs" />
+    <Compile Include="../../DiscordConnector/Records/CookingStore.cs" Link="CookingStore.cs" />
+    <Compile Include="../../DiscordConnector/Records/ActivityStore.cs" Link="ActivityStore.cs" />
+    <Compile Include="../../DiscordConnector/Records/DatabaseDiagnostics.cs" Link="DatabaseDiagnostics.cs" />
+    <Compile Include="../../DiscordConnector/DiscordApi.cs" Link="DiscordApi.cs" />
+    <Compile Include="../../DiscordConnector/MessageTransformer.cs" Link="MessageTransformer.cs" />
+    <Compile Include="../../DiscordConnector/EmbedBuilder.cs" Link="EmbedBuilder.cs" />
+    <Compile Include="../../DiscordConnector/EmbedTemplates.cs" Link="EmbedTemplates.cs" />
+    <Compile Include="../../DiscordConnector/Webhook.cs" Link="Webhook.cs" />
+  </ItemGroup>
+</Project>
